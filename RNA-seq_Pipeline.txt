@@ -1,0 +1,125 @@
+################################################NCBI SRR数据下载##################################
+##sra-tools == 3.1.1
+
+## 1. conda安装
+conda install -c bioconda sra-tools 
+
+## 2. 批量下载 
+prefetch --option-file SRR_Acc_List.txt  #（速度较慢）
+# 分割加速下载
+#split -l 10 SRR_Acc_List.txt part_
+# 并行运行多个 prefetch 命令
+#for part in part_*; do
+#    /home/xywh/anaconda3/envs/rna/bin/prefetch --option-file $part &
+#done
+
+##批量检测###批量检测有问题
+
+for j in `sort -u SRR_Acc_List.txt`
+do
+vdb-validate $j
+done
+
+###单个检测没有问题
+vdb-validate SRR23245069.sra
+
+## 3. 移动文件夹中的文件到当前路径
+find . -mindepth 2 -type f -exec mv -t . {} +
+## 4. 批量拆分sra文件为fastq.gz
+cat SRR_Acc_List.txt|while read srr; do (fastq-dump --gzip --split-files -A $srr ${srr}.sra); done
+
+mkdir sra
+mv *.sra sra
+
+#################################################RNA-seq###########################################
+##转录组分析需要用到的软件列表
+##质控：fastqc, multiqc, trimmomatic, cutadapt, trim-galore
+##比对：star, hisat2, bowtie2, tophat, bwa, subread
+##计数：htseq, bedtools, deeptools, salmon
+conda search packagename #安装之前先检索是否存在该软件,可以在conda中查找。
+conda install -y cutadapt 
+conda install -y multiqc 
+conda install -y trim-galore 
+conda install -y star 
+conda install -y hisat2   
+conda install -y subread 
+conda install -y deeptools  
+conda install -y samtools
+ 
+#cutadapt = 4.9
+#multiqc = 1.23
+#trim-galore = 0.6.10
+#star = 2.5.1b
+#hisat2 = 2.2.1
+#subread = 2.0.6  
+#deeptools = 3.5.5
+#samtools = 1.9
+
+
+##一、数据质控https://www.jianshu.com/p/1f7dda430015
+# 2.先进行fastqc
+nohup fastqc -t 128 -o clean_data_fastqc/ clean_data/SRR*.fastq.gz >qc.log &  
+#nohup fastqc -t 12 -o ./ SRR*.fastq.gz >qc.log 2>&1 & ##或这种 
+#nohup fastqc -t 12 -o ./ SRR17210861_2.fastq.gz >qc.log 2>&1 & 
+# 3.对fastqc后的zip数据进行multiqc，此步骤是将多了fastqc质检文件整合起来。
+nohup multiqc clean_data_fastqc/*.zip -o clean_data_fastqc/ > ./multiqc.log &
+
+##二: trimmgalore质控 对原始测序数据进行过滤
+ls clean_data/*gz | xargs -n 2 -t nohup trim_galore  -q 25 --phred33 --length 36 --stringency 3 --paired -j 12 -o clean_data_trimmgalore/  &
+##https://zhuanlan.zhihu.com/p/590066099?utm_id=0
+
+
+##三:质控后数据也需要用fastqc与multiqc看看质控效果，对比与之前的未质控时的差异。
+# 01批量fastqc
+nohup fastqc -t 128 -o clean_data_trimmgalore/ clean_data_trimmgalore/SRR*_val*.fq.gz >qc_trimmed.log & 
+#出现“_appending output to 'nohup.out'”时代表已在后台运行
+# 02开始multiqc
+nohup multiqc clean_data_trimmgalore/*.zip -o clean_data_trimmgalore/ > ./multiqc_t.log &
+#查看质控后过滤的数据
+ls -lh  clean_data_trimmgalore/*fq.gz|cut -d" " -f 5-
+
+#NCBI上下载参考基因组以及注释文件
+#在miniconda中创建文件夹
+mkdir pri_hg38_index
+cd pri_hg38_index
+
+##比对 在过滤完测序原始文件，并且搭建好人类的参考基因组之后，即可对测序数据进行比对。
+##https://zhuanlan.zhihu.com/p/383397412人类基因组注释参考
+##转录组比对主要有hisat2、subjunc、star，基因组比对主要有bwa、bowtie2
+##查看后台
+# hg38 reference文件
+wget https://hgdownload.soe.ucsc.edu/goldenPath/hg38/bigZips/latest/hg38.fa.gz
+# hg38 md5sum文件，用于检查hg38 reference文件是否完整
+wget https://hgdownload.soe.ucsc.edu/goldenPath/hg38/bigZips/latest/md5sum.txt
+md5sum hg38.fa.gz
+#bwa 建立参考基因组index
+#nohup bwa index hg38.fa -p hg38.fa 2>>hg38.fa_index.log &
+
+# 创建转录组数据索引
+pigz -d hg38.fa.gz
+hisat2-build -p 128 hg38.fa hg38Hisat2Index
+
+
+#以双端为例：https://www.jianshu.com/p/49fc02ec076e转化成bam文件
+mkdir log
+mkdir 04_bam
+
+for i in `ls *_1_val_1.fq.gz `
+do
+    i=`basename $i`
+    i=${i%*_1_val_1.fq.gz}
+    echo $i >>log/hisat2_log.txt
+
+hisat2  -p  100  --dta  --rna-strandness RF  -x  /xywhc/referece/pri_hg38_index/hg38Hisat2Index  -1  $i\_1_val_1.fq.gz  -2  $i\_2_val_2.fq.gz  2>>log/hisat2_log.txt | samtools sort  -@  4  -o  04_bam/$i.bam   2>>log/hisat2_log.txt
+
+done
+
+#定量完成以上所有步骤后，最后一步即是定量。
+mkdir ncbi
+cd ncbi
+###转录组基因注释文件Homo_sapiens.GRCh38.105.chr.gtf.gz
+wget ftp.ensembl.org/pub/release-105/gtf/homo_sapiens/Homo_sapiens.GRCh38.105.chr.gtf.gz
+pigz -d Homo_sapiens.GRCh38.105.chr.gtf.gz
+cd ..
+featureCounts -T 64 -p -t exon -g gene_id -a /xywhc/referece/pri_hg38_index/Homo_sapiens.GRCh38.105.chr.gtf -o 04_bam/all.id.txt 04_bam/*.bam 1>counts.id.log 2>&1
+#######################定量完成######################
